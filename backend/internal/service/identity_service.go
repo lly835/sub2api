@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -210,10 +209,16 @@ func (s *IdentityService) ApplyFingerprint(req *http.Request, fp *Fingerprint) {
 // 支持旧拼接格式和新 JSON 格式的 user_id 解析，
 // 根据 fingerprintUA 版本选择输出格式。
 //
+// anonymize 参数控制是否启用身份匿名化：
+//   - false（默认）：device_id 使用账号绑定的真实 client_id，account_uuid 使用账号真实 UUID
+//   - true（隐私模式）：device_id 和 account_uuid 替换为基于账号 ID 的稳定伪名（SHA-256 派生），
+//     上游无法通过这两个字段关联到真实账号或设备，但 session_id 语义完全保留，
+//     sticky session 路由和并发限流逻辑不受影响。
+//
 // 重要：此函数使用 json.RawMessage 保留其他字段的原始字节，
 // 避免重新序列化导致 thinking 块等内容被修改。
-func (s *IdentityService) RewriteUserID(body []byte, accountID int64, accountUUID, cachedClientID, fingerprintUA string) ([]byte, error) {
-	if len(body) == 0 || accountUUID == "" || cachedClientID == "" {
+func (s *IdentityService) RewriteUserID(body []byte, accountID int64, accountUUID, cachedClientID, fingerprintUA string, anonymize bool) ([]byte, error) {
+	if len(body) == 0 || cachedClientID == "" {
 		return body, nil
 	}
 
@@ -234,21 +239,24 @@ func (s *IdentityService) RewriteUserID(body []byte, accountID int64, accountUUI
 		return body, nil
 	}
 
-	// 解析 user_id（兼容旧拼接格式和新 JSON 格式）
 	parsed := ParseMetadataUserID(userID)
 	if parsed == nil {
 		return body, nil
 	}
 
-	sessionTail := parsed.SessionID // 原始session UUID
-
-	// 生成新的session hash: SHA256(accountID::sessionTail) -> UUID格式
+	sessionTail := parsed.SessionID
 	seed := fmt.Sprintf("%d::%s", accountID, sessionTail)
 	newSessionHash := generateUUIDFromSeed(seed)
 
-	// 根据客户端版本选择输出格式
+	deviceID := cachedClientID
+	formattedAccountUUID := accountUUID
+	if anonymize {
+		deviceID = generateClientIDFromSeed(fmt.Sprintf("metadata-device:%d", accountID))
+		formattedAccountUUID = generateUUIDFromSeed(fmt.Sprintf("metadata-account:%d", accountID))
+	}
+
 	version := ExtractCLIVersion(fingerprintUA)
-	newUserID := FormatMetadataUserID(cachedClientID, accountUUID, newSessionHash, version)
+	newUserID := FormatMetadataUserID(deviceID, formattedAccountUUID, newSessionHash, version)
 	if newUserID == userID {
 		return body, nil
 	}
@@ -261,20 +269,20 @@ func (s *IdentityService) RewriteUserID(body []byte, accountID int64, accountUUI
 }
 
 // RewriteUserIDWithMasking 重写body中的metadata.user_id，支持会话ID伪装
-// 如果账号启用了会话ID伪装（session_id_masking_enabled），
+// 如果账号启用了会话ID伪装（session_id_masking_enabled）或 maskingOverride 为 true，
 // 则在完成常规重写后，将 session 部分替换为固定的伪装ID（15分钟内保持不变）
+//
+// maskingOverride 用于隐私模式总开关：开启时无需账号级别配置即可强制伪装。
 //
 // 重要：此函数使用 json.RawMessage 保留其他字段的原始字节，
 // 避免重新序列化导致 thinking 块等内容被修改。
-func (s *IdentityService) RewriteUserIDWithMasking(ctx context.Context, body []byte, account *Account, accountUUID, cachedClientID, fingerprintUA string) ([]byte, error) {
-	// 先执行常规的 RewriteUserID 逻辑
-	newBody, err := s.RewriteUserID(body, account.ID, accountUUID, cachedClientID, fingerprintUA)
+func (s *IdentityService) RewriteUserIDWithMasking(ctx context.Context, body []byte, account *Account, accountUUID, cachedClientID, fingerprintUA string, anonymize bool, maskingOverride bool) ([]byte, error) {
+	newBody, err := s.RewriteUserID(body, account.ID, accountUUID, cachedClientID, fingerprintUA, anonymize)
 	if err != nil {
 		return newBody, err
 	}
 
-	// 检查是否启用会话ID伪装
-	if !account.IsSessionIDMaskingEnabled() {
+	if !maskingOverride && !account.IsSessionIDMaskingEnabled() {
 		return newBody, nil
 	}
 
@@ -295,13 +303,11 @@ func (s *IdentityService) RewriteUserIDWithMasking(ctx context.Context, body []b
 		return newBody, nil
 	}
 
-	// 解析已重写的 user_id
 	uidParsed := ParseMetadataUserID(userID)
 	if uidParsed == nil {
 		return newBody, nil
 	}
 
-	// 获取或生成固定的伪装 session ID
 	maskedSessionID, err := s.cache.GetMaskedSessionID(ctx, account.ID)
 	if err != nil {
 		logger.LegacyPrintf("service.identity", "Warning: failed to get masked session ID for account %d: %v", account.ID, err)
@@ -309,26 +315,16 @@ func (s *IdentityService) RewriteUserIDWithMasking(ctx context.Context, body []b
 	}
 
 	if maskedSessionID == "" {
-		// 首次或已过期，生成新的伪装 session ID
 		maskedSessionID = generateRandomUUID()
-		logger.LegacyPrintf("service.identity", "Generated new masked session ID for account %d: %s", account.ID, maskedSessionID)
+		logger.LegacyPrintf("service.identity", "Generated new masked session ID for account %d", account.ID)
 	}
 
-	// 刷新 TTL（每次请求都刷新，保持 15 分钟有效期）
 	if err := s.cache.SetMaskedSessionID(ctx, account.ID, maskedSessionID); err != nil {
 		logger.LegacyPrintf("service.identity", "Warning: failed to set masked session ID for account %d: %v", account.ID, err)
 	}
 
-	// 用 FormatMetadataUserID 重建（保持与 RewriteUserID 相同的格式）
 	version := ExtractCLIVersion(fingerprintUA)
 	newUserID := FormatMetadataUserID(uidParsed.DeviceID, uidParsed.AccountUUID, maskedSessionID, version)
-
-	slog.Debug("session_id_masking_applied",
-		"account_id", account.ID,
-		"before", userID,
-		"after", newUserID,
-	)
-
 	if newUserID == userID {
 		return newBody, nil
 	}
@@ -368,6 +364,11 @@ func generateClientID() string {
 		return hex.EncodeToString(h[:])
 	}
 	return hex.EncodeToString(b)
+}
+
+func generateClientIDFromSeed(seed string) string {
+	hash := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(hash[:])
 }
 
 // generateUUIDFromSeed 从种子生成确定性UUID v4格式字符串

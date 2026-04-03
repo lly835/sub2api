@@ -65,3 +65,40 @@ func TestFilterHeadersEnabledUsesAllowlist(t *testing.T) {
 		t.Fatalf("expected X-Blocked removed, got %q", filtered.Get("X-Blocked"))
 	}
 }
+
+func TestFilterHeadersBuiltinBlockedAlwaysRemoved(t *testing.T) {
+	src := http.Header{}
+	src.Add("Set-Cookie", "secret=upstream")
+	src.Add("Alt-Svc", "h3=\":443\"")
+	src.Add("Server-Timing", "edge;dur=1")
+	src.Add("NEL", "{\"report_to\":\"default\"}")
+	src.Add("Report-To", "{\"group\":\"default\"}")
+	src.Add("Content-Type", "application/json")
+
+	filtered := FilterHeaders(src, CompileHeaderFilter(config.ResponseHeaderConfig{}))
+	if filtered.Get("Set-Cookie") != "" || filtered.Get("Alt-Svc") != "" || filtered.Get("Server-Timing") != "" || filtered.Get("NEL") != "" || filtered.Get("Report-To") != "" {
+		t.Fatalf("expected builtin blocked headers removed, got %#v", filtered)
+	}
+	if filtered.Get("Content-Type") != "application/json" {
+		t.Fatalf("expected Content-Type preserved, got %q", filtered.Get("Content-Type"))
+	}
+}
+
+func TestFilterHeadersAdditionalAllowedCannotReenableBuiltinBlocked(t *testing.T) {
+	src := http.Header{}
+	src.Add("Set-Cookie", "secret=upstream")
+	src.Add("Alt-Svc", "h3=\":443\"")
+	src.Add("Content-Type", "application/json")
+
+	cfg := config.ResponseHeaderConfig{
+		Enabled:           true,
+		AdditionalAllowed: []string{"set-cookie", "alt-svc"},
+	}
+	filtered := FilterHeaders(src, CompileHeaderFilter(cfg))
+	if filtered.Get("Set-Cookie") != "" || filtered.Get("Alt-Svc") != "" {
+		t.Fatalf("expected builtin blocked headers to stay blocked, got %#v", filtered)
+	}
+	if filtered.Get("Content-Type") != "application/json" {
+		t.Fatalf("expected Content-Type preserved, got %q", filtered.Get("Content-Type"))
+	}
+}

@@ -34,6 +34,25 @@ var defaultAllowed = map[string]struct{}{
 	"www-authenticate":               {},
 }
 
+// builtinBlocked 是内建的强制剥离响应头集合，优先级高于所有白名单配置。
+// 这些头部可被上游（如 Anthropic）用于追踪客户端标识、注入 Cookie 或探测网络路径，
+// 不应透传给 API 调用方。即使 additional_allowed 中显式列出，也无法重新放行。
+//
+//   - set-cookie:           上游 Cookie，可用于跨请求追踪用户会话
+//   - alt-svc:              HTTP/3 升级广播，可揭示上游 CDN/节点信息
+//   - server-timing:        服务端性能计时，可辅助上游拓扑推断
+//   - report-to:            网络错误上报端点，可将客户端网络事件发回上游
+//   - nel:                  Network Error Logging，同上
+//   - origin-agent-cluster: 浏览器隔离策略头，对 API 客户端无意义且可能泄露信息
+var builtinBlocked = map[string]struct{}{
+	"set-cookie":           {},
+	"alt-svc":              {},
+	"server-timing":        {},
+	"report-to":            {},
+	"nel":                  {},
+	"origin-agent-cluster": {},
+}
+
 // hopByHopHeaders 是跳过的 hop-by-hop 头部，这些头部由 HTTP 库自动处理
 var hopByHopHeaders = map[string]struct{}{
 	"content-length":    {},
@@ -64,9 +83,11 @@ func CompileHeaderFilter(cfg config.ResponseHeaderConfig) *CompiledHeaderFilter 
 		}
 	}
 
-	forceRemove := map[string]struct{}{}
+	forceRemove := make(map[string]struct{}, len(builtinBlocked)+len(cfg.ForceRemove))
+	for key := range builtinBlocked {
+		forceRemove[key] = struct{}{}
+	}
 	if cfg.Enabled {
-		forceRemove = make(map[string]struct{}, len(cfg.ForceRemove))
 		for _, key := range cfg.ForceRemove {
 			normalized := strings.ToLower(strings.TrimSpace(key))
 			if normalized == "" {
